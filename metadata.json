@@ -1,0 +1,5 @@
+{
+  "name": "Mibawa TV - Election Updates Console",
+  "description": "An operator console for managing and displaying live election results for the Mibawa TV Tripartite General Election broadcast.",
+  "requestFramePermissions": []
+}

@@ -1,0 +1,303 @@
+// FIX: Declare global variables provided by the environment to resolve TypeScript errors regarding undefined names.
+declare const __app_id: string;
+declare const __firebase_config: string;
+declare const __initial_auth_token: string | null;
+
+import React, { useState, useEffect, useMemo } from 'react';
+// FIX: Use named imports for firebase/app to resolve module resolution errors.
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getAuth, onAuthStateChanged, signInAnonymously, type User } from 'firebase/auth';
+import { getFirestore, doc, onSnapshot, setDoc, serverTimestamp, type Firestore } from 'firebase/firestore';
+
+
+import type { PollingCenter, Votes, FlatPollingCenter } from './types';
+import { ELECTORAL_DATA, PERMANENT_CANDIDIDATES, POLLING_CENTER_VOTER_COUNTS } from './data/electoralData';
+import Modal from './components/Modal';
+import BarGraph from './components/BarGraph';
+import SearchPollingCenter from './components/SearchPollingCenter';
+import { WarningIcon } from './components/Icons';
+
+// Global variables provided by the Canvas environment.
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+
+const initialVotesState = PERMANENT_CANDIDIDATES.reduce((acc, candidate) => {
+    acc[candidate.abbreviation] = 0;
+    return acc;
+}, {} as Votes);
+
+// --- MAIN APP COMPONENT ---
+
+const App: React.FC = () => {
+  // FIX: Use Firebase v9 types
+  const [db, setDb] = useState<Firestore | null>(null);
+  const [user, setUser] = useState<User | null>(null);
+
+  const [selectedRegion, setSelectedRegion] = useState('');
+  const [selectedDistrict, setSelectedDistrict] = useState('');
+  const [selectedConstituency, setSelectedConstituency] = useState('');
+  const [selectedPollingCenter, setSelectedPollingCenter] = useState<PollingCenter | null>(null);
+
+  const [votes, setVotes] = useState<Votes>(initialVotesState);
+  const [nullAndVoidVotes, setNullAndVoidVotes] = useState(0);
+  
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [showModal, setShowModal] = useState(false);
+  const [modalContent, setModalContent] = useState({ title: '', message: '' });
+
+  // Memoize the flattened list of all polling centers for search
+  const allPollingCenters = useMemo<FlatPollingCenter[]>(() => {
+    const centers: FlatPollingCenter[] = [];
+    for (const region in ELECTORAL_DATA) {
+        const regionData = ELECTORAL_DATA[region as keyof typeof ELECTORAL_DATA];
+        for (const district in regionData) {
+            const districtData = regionData[district as keyof typeof regionData];
+            for (const constituency in districtData) {
+                const pcs = districtData[constituency as keyof typeof districtData];
+                pcs.forEach(pc => {
+                    centers.push({ ...pc, region, district, constituency });
+                });
+            }
+        }
+    }
+    return centers;
+  }, []);
+  
+  // Firebase Initialization and Auth
+  useEffect(() => {
+    if (Object.keys(firebaseConfig).length > 0) {
+      // FIX: Use Firebase v9+ API
+      // FIX: Use named imports for firebase/app functions to fix module resolution errors.
+      const app = !getApps().length ? initializeApp(firebaseConfig, appId) : getApp(appId);
+      const auth = getAuth(app);
+      setDb(getFirestore(app));
+      
+      const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+        setUser(currentUser);
+        if (!currentUser) {
+          signInAnonymously(auth).catch((error) => {
+            console.error("Anonymous sign-in failed:", error);
+          });
+        }
+      });
+
+      return () => unsubscribe();
+    }
+  }, []);
+
+  // Firestore listener for real-time updates
+  useEffect(() => {
+    if (db && selectedPollingCenter?.code) {
+      // FIX: Use Firebase v9+ Firestore API
+      const docRef = doc(db, "results", selectedPollingCenter.code);
+      const unsub = onSnapshot(docRef, (docSnap) => {
+        // FIX: Use `exists()` function for v9
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          if (data) {
+            const newVotes: Votes = {};
+            PERMANENT_CANDIDIDATES.forEach(c => {
+              newVotes[c.abbreviation] = data[c.abbreviation] || 0;
+            });
+            setVotes(newVotes);
+            setNullAndVoidVotes(data.nullAndVoid || 0);
+          }
+        } else {
+          setVotes(initialVotesState);
+          setNullAndVoidVotes(0);
+        }
+      });
+      return () => unsub();
+    }
+  }, [db, selectedPollingCenter]);
+
+  const resetSelections = (level: 'all' | 'region' | 'district' | 'constituency') => {
+    if (level === 'all') setSelectedRegion('');
+    if (level === 'all' || level === 'region') setSelectedDistrict('');
+    if (level === 'all' || level === 'region' || level === 'district') setSelectedConstituency('');
+    if (level === 'all' || level === 'region' || level === 'district' || level === 'constituency') setSelectedPollingCenter(null);
+    setVotes(initialVotesState);
+    setNullAndVoidVotes(0);
+  };
+  
+  const handlePollingCenterSelect = (pc: FlatPollingCenter | null) => {
+    if (pc) {
+      setSelectedRegion(pc.region);
+      setSelectedDistrict(pc.district);
+      setSelectedConstituency(pc.constituency);
+      setSelectedPollingCenter({ code: pc.code, name: pc.name });
+    } else {
+      resetSelections('all');
+    }
+  };
+
+  const handleVoteChange = (abbreviation: string, value: string) => {
+    const newVotes = { ...votes };
+    const numValue = parseInt(value, 10);
+    newVotes[abbreviation] = isNaN(numValue) || numValue < 0 ? 0 : numValue;
+    setVotes(newVotes);
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!db || !selectedPollingCenter?.code || !user) return;
+    
+    // Prevent submission if votes exceed voters
+    if (totalVotesCast > registeredVoters && registeredVoters > 0) {
+        setModalContent({ title: 'Validation Error', message: 'Total votes cast cannot exceed the number of registered voters. Please correct the values before submitting.' });
+        setShowModal(true);
+        return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      // FIX: Use Firebase v9+ Firestore API
+      const docRef = doc(db, "results", selectedPollingCenter.code);
+      const dataToSave = { ...votes, nullAndVoid: nullAndVoidVotes, lastUpdatedBy: user.uid, timestamp: serverTimestamp() };
+      await setDoc(docRef, dataToSave, { merge: true });
+      setModalContent({ title: 'Success', message: 'Results have been successfully submitted.' });
+      setShowModal(true);
+    } catch (error) {
+      console.error("Error submitting results:", error);
+      setModalContent({ title: 'Error', message: `Failed to submit results. ${error instanceof Error ? error.message : ''}` });
+      setShowModal(true);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const { districts, constituencies, pollingCenters, registeredVoters, totalVotesCast, turnout, validationError } = useMemo(() => {
+    const regionData = selectedRegion ? ELECTORAL_DATA[selectedRegion as keyof typeof ELECTORAL_DATA] : null;
+    const districts = regionData ? Object.keys(regionData) : [];
+    
+    const districtData = regionData && selectedDistrict ? regionData[selectedDistrict as keyof typeof regionData] : null;
+    const constituencies = districtData ? Object.keys(districtData) : [];
+
+    const pollingCenters = districtData && selectedConstituency ? districtData[selectedConstituency as keyof typeof districtData] : [];
+    
+    const registeredVoters = selectedPollingCenter ? POLLING_CENTER_VOTER_COUNTS[selectedPollingCenter.code] || 0 : 0;
+    const totalVotesCast = Object.values(votes).reduce((sum: number, current: number) => sum + current, 0) + nullAndVoidVotes;
+    const turnout = registeredVoters > 0 ? (totalVotesCast / registeredVoters) * 100 : 0;
+    const validationError = registeredVoters > 0 && totalVotesCast > registeredVoters;
+
+    return { districts, constituencies, pollingCenters, registeredVoters, totalVotesCast, turnout, validationError };
+  }, [selectedRegion, selectedDistrict, selectedConstituency, selectedPollingCenter, votes, nullAndVoidVotes]);
+
+  const barChartData = useMemo(() => {
+      return PERMANENT_CANDIDIDATES.map(c => ({
+          name: c.abbreviation,
+          party: c.party,
+          value: votes[c.abbreviation] || 0,
+          color: c.color
+      }));
+  }, [votes]);
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-800 p-4 sm:p-6 lg:p-8">
+      <Modal show={showModal} onClose={() => setShowModal(false)} title={modalContent.title} message={modalContent.message} />
+      <div className="max-w-7xl mx-auto">
+        <header className="mb-8">
+          <h1 className="text-4xl font-bold text-gray-900">Mibawa TV Election Console</h1>
+          <p className="text-lg text-gray-600 mt-1">Live Election Results Operator Panel</p>
+        </header>
+
+        <main className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          {/* Left Column: Selections & Data Entry */}
+          <div className="lg:col-span-1 space-y-6">
+            <div className="bg-white p-6 rounded-xl shadow-md">
+              <h2 className="text-xl font-bold mb-4 border-b pb-2">Select Polling Center</h2>
+               <div className="space-y-4">
+                 <SearchPollingCenter allPollingCenters={allPollingCenters} onSelect={handlePollingCenterSelect} />
+                 <hr/>
+                {/* Selects */}
+                <select value={selectedRegion} onChange={e => { setSelectedRegion(e.target.value); resetSelections('region'); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 focus:ring-blue-500 focus:border-blue-500">
+                  <option value="">-- Select Region --</option>
+                  {Object.keys(ELECTORAL_DATA).map(r => <option key={r} value={r}>{r}</option>)}
+                </select>
+                <select value={selectedDistrict} disabled={!selectedRegion} onChange={e => { setSelectedDistrict(e.target.value); resetSelections('district'); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 disabled:bg-gray-200 focus:ring-blue-500 focus:border-blue-500">
+                   <option value="">-- Select District --</option>
+                   {districts.map(d => <option key={d} value={d}>{d}</option>)}
+                </select>
+                <select value={selectedConstituency} disabled={!selectedDistrict} onChange={e => { setSelectedConstituency(e.target.value); resetSelections('constituency'); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 disabled:bg-gray-200 focus:ring-blue-500 focus:border-blue-500">
+                   <option value="">-- Select Constituency --</option>
+                   {constituencies.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+                <select value={selectedPollingCenter?.code || ''} disabled={!selectedConstituency} onChange={e => { const pc = pollingCenters.find(p => p.code === e.target.value) || null; setSelectedPollingCenter(pc); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 disabled:bg-gray-200 focus:ring-blue-500 focus:border-blue-500">
+                   <option value="">-- Select Polling Center --</option>
+                   {pollingCenters.map(p => <option key={p.code} value={p.code}>{p.name} ({p.code})</option>)}
+                </select>
+              </div>
+            </div>
+
+            {selectedPollingCenter && (
+              <form onSubmit={handleSubmit} className="bg-white p-6 rounded-xl shadow-md">
+                <h3 className="text-lg font-bold mb-4">Enter Votes for: <span className="text-blue-600">{selectedPollingCenter.name}</span></h3>
+                <div className="space-y-4 max-h-96 overflow-y-auto pr-2">
+                  {PERMANENT_CANDIDIDATES.map(c => (
+                     <div key={c.abbreviation} className="grid grid-cols-2 gap-4 items-center">
+                        <label htmlFor={c.abbreviation} className="font-medium">
+                          {c.name}
+                          <span className="block text-xs text-gray-500">{c.party} ({c.abbreviation})</span>
+                        </label>
+                        <input type="number" min="0" id={c.abbreviation} value={votes[c.abbreviation] || ''} onChange={e => handleVoteChange(c.abbreviation, e.target.value)} className="w-full p-2 border border-gray-300 rounded-md text-right focus:ring-blue-500 focus:border-blue-500" />
+                     </div>
+                  ))}
+                   <div className="grid grid-cols-2 gap-4 items-center border-t pt-4 mt-2">
+                      <label htmlFor="nullAndVoid" className="font-semibold text-red-600">Null & Void</label>
+                      <input type="number" min="0" id="nullAndVoid" value={nullAndVoidVotes || ''} onChange={e => setNullAndVoidVotes(parseInt(e.target.value) || 0)} className="w-full p-2 border border-gray-300 rounded-md text-right focus:ring-blue-500 focus:border-blue-500" />
+                   </div>
+                </div>
+                 <button type="submit" disabled={isSubmitting} className="mt-6 w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-md hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors flex items-center justify-center">
+                    {isSubmitting ? 'Submitting...' : 'Submit Results'}
+                 </button>
+              </form>
+            )}
+          </div>
+          
+          {/* Right Column: Stats & Graph */}
+          <div className="lg:col-span-2 space-y-6">
+            <div className="bg-white p-6 rounded-xl shadow-md">
+                <h2 className="text-xl font-bold mb-4 border-b pb-2">Statistics</h2>
+                {selectedPollingCenter ? (
+                    <>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-center">
+                        <div>
+                            <p className="text-gray-500 text-sm">Registered Voters</p>
+                            <p className="text-3xl font-bold">{registeredVoters.toLocaleString()}</p>
+                        </div>
+                        <div>
+                            <p className="text-gray-500 text-sm">Total Votes Cast</p>
+                            <p className={`text-3xl font-bold ${validationError ? 'text-red-500' : ''}`}>{totalVotesCast.toLocaleString()}</p>
+                        </div>
+                        <div>
+                            <p className="text-gray-500 text-sm">Voter Turnout</p>
+                            <p className={`text-3xl font-bold ${validationError ? 'text-red-500' : 'text-green-600'}`}>{turnout.toFixed(2)}%</p>
+                        </div>
+                    </div>
+                    {validationError && (
+                      <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-md flex items-center gap-3">
+                        <WarningIcon className="w-6 h-6 text-red-500 flex-shrink-0" />
+                        <p className="text-sm font-medium text-red-700">Warning: Total votes cast exceed the number of registered voters.</p>
+                      </div>
+                    )}
+                    </>
+                ) : (
+                    <p className="text-gray-500 text-center py-8">Select a polling center to view statistics.</p>
+                )}
+            </div>
+             <div className="bg-white p-6 rounded-xl shadow-md">
+                <h2 className="text-xl font-bold mb-4 border-b pb-2">Results Graph</h2>
+                 {selectedPollingCenter ? (
+                     <BarGraph data={barChartData} totalVotes={totalVotesCast > 0 ? totalVotesCast : 1} />
+                 ) : (
+                     <p className="text-gray-500 text-center py-8">Select a polling center to view results.</p>
+                 )}
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+};
+
+export default App;
