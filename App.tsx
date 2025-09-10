@@ -4,10 +4,10 @@ declare const __firebase_config: string;
 declare const __initial_auth_token: string | null;
 
 import React, { useState, useEffect, useMemo } from 'react';
-// FIX: Use named imports for firebase/app to resolve module resolution errors.
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getAuth, onAuthStateChanged, signInAnonymously, type User } from 'firebase/auth';
-import { getFirestore, doc, onSnapshot, setDoc, serverTimestamp, type Firestore } from 'firebase/firestore';
+// FIX: Reverted to Firebase v8 compat API to resolve module errors, as the environment seems to be using older Firebase versions.
+import firebase from 'firebase/compat/app';
+import 'firebase/compat/auth';
+import 'firebase/compat/firestore';
 
 
 import type { PollingCenter, Votes, FlatPollingCenter } from './types';
@@ -16,6 +16,7 @@ import Modal from './components/Modal';
 import BarGraph from './components/BarGraph';
 import SearchPollingCenter from './components/SearchPollingCenter';
 import { WarningIcon } from './components/Icons';
+import LoadingSpinner from './components/LoadingSpinner';
 
 // Global variables provided by the Canvas environment.
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
@@ -29,17 +30,25 @@ const initialVotesState = PERMANENT_CANDIDIDATES.reduce((acc, candidate) => {
 // --- MAIN APP COMPONENT ---
 
 const App: React.FC = () => {
-  // FIX: Use Firebase v9 types
-  const [db, setDb] = useState<Firestore | null>(null);
-  const [user, setUser] = useState<User | null>(null);
+  // FIX: Use Firebase v8 compat types.
+  const [db, setDb] = useState<firebase.firestore.Firestore | null>(null);
+  const [user, setUser] = useState<firebase.User | null>(null);
 
+  const [viewMode, setViewMode] = useState<'pollingCenter' | 'district'>('pollingCenter');
   const [selectedRegion, setSelectedRegion] = useState('');
   const [selectedDistrict, setSelectedDistrict] = useState('');
   const [selectedConstituency, setSelectedConstituency] = useState('');
   const [selectedPollingCenter, setSelectedPollingCenter] = useState<PollingCenter | null>(null);
 
+  // State for polling center view
   const [votes, setVotes] = useState<Votes>(initialVotesState);
   const [nullAndVoidVotes, setNullAndVoidVotes] = useState(0);
+
+  // State for district view
+  const [districtVotes, setDistrictVotes] = useState<Votes>(initialVotesState);
+  const [districtNullAndVoid, setDistrictNullAndVoid] = useState(0);
+  const [districtRegisteredVoters, setDistrictRegisteredVoters] = useState(0);
+  const [isLoadingDistrictData, setIsLoadingDistrictData] = useState(false);
   
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showModal, setShowModal] = useState(false);
@@ -65,34 +74,38 @@ const App: React.FC = () => {
   
   // Firebase Initialization and Auth
   useEffect(() => {
-    if (Object.keys(firebaseConfig).length > 0) {
-      // FIX: Use Firebase v9+ API
-      // FIX: Use named imports for firebase/app functions to fix module resolution errors.
-      const app = !getApps().length ? initializeApp(firebaseConfig, appId) : getApp(appId);
-      const auth = getAuth(app);
-      setDb(getFirestore(app));
-      
-      const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-        setUser(currentUser);
-        if (!currentUser) {
-          signInAnonymously(auth).catch((error) => {
-            console.error("Anonymous sign-in failed:", error);
-          });
+    if (Object.keys(firebaseConfig).length > 0 && !db) {
+      // FIX: Use Firebase v8 compat API for initialization and auth.
+      try {
+        if (!firebase.apps.length) {
+          firebase.initializeApp(firebaseConfig);
         }
-      });
+        const auth = firebase.auth();
+        setDb(firebase.firestore());
+      
+        const unsubscribe = auth.onAuthStateChanged((currentUser) => {
+          setUser(currentUser);
+          if (!currentUser) {
+            auth.signInAnonymously().catch((error) => {
+              console.error("Anonymous sign-in failed:", error);
+            });
+          }
+        });
 
-      return () => unsubscribe();
+        return () => unsubscribe();
+      } catch (error) {
+          console.error("Firebase initialization error:", error);
+      }
     }
-  }, []);
+  }, [db]);
 
-  // Firestore listener for real-time updates
+  // Firestore listener for polling center view
   useEffect(() => {
-    if (db && selectedPollingCenter?.code) {
-      // FIX: Use Firebase v9+ Firestore API
-      const docRef = doc(db, "results", selectedPollingCenter.code);
-      const unsub = onSnapshot(docRef, (docSnap) => {
-        // FIX: Use `exists()` function for v9
-        if (docSnap.exists()) {
+    if (db && selectedPollingCenter?.code && viewMode === 'pollingCenter') {
+      // FIX: Use Firebase v8 compat Firestore API.
+      const docRef = db.collection("results").doc(selectedPollingCenter.code);
+      const unsub = docRef.onSnapshot((docSnap) => {
+        if (docSnap.exists) {
           const data = docSnap.data();
           if (data) {
             const newVotes: Votes = {};
@@ -109,7 +122,90 @@ const App: React.FC = () => {
       });
       return () => unsub();
     }
-  }, [db, selectedPollingCenter]);
+  }, [db, selectedPollingCenter, viewMode]);
+
+    // Firestore listener for district view (aggregates data)
+    useEffect(() => {
+        if (viewMode !== 'district' || !db || !selectedRegion || !selectedDistrict) {
+            setDistrictVotes(initialVotesState);
+            setDistrictNullAndVoid(0);
+            setDistrictRegisteredVoters(0);
+            return;
+        }
+
+        setIsLoadingDistrictData(true);
+
+        const regionData = ELECTORAL_DATA[selectedRegion as keyof typeof ELECTORAL_DATA];
+        const districtData = regionData?.[selectedDistrict as keyof typeof regionData];
+        if (!districtData) {
+            setIsLoadingDistrictData(false);
+            return;
+        }
+
+        let totalVoters = 0;
+        const districtPcCodes: string[] = [];
+        Object.values(districtData).forEach(constituencyPCs => {
+            constituencyPCs.forEach(pc => {
+                districtPcCodes.push(pc.code);
+                totalVoters += POLLING_CENTER_VOTER_COUNTS[pc.code] || 0;
+            });
+        });
+        setDistrictRegisteredVoters(totalVoters);
+
+        // Reset state before attaching new listeners
+        setDistrictVotes(initialVotesState);
+        setDistrictNullAndVoid(0);
+
+        // A local cache to hold the current data for each PC to calculate deltas
+        const allPcData: { [code: string]: { votes: Votes, nullAndVoid: number } } = {};
+
+        const unsubscribes = districtPcCodes.map(code => {
+            const docRef = db.collection("results").doc(code);
+            return docRef.onSnapshot((docSnap) => {
+                // Get old data from cache, or assume zeros if it's the first time for this doc.
+                const oldData = allPcData[code] || { votes: initialVotesState, nullAndVoid: 0 };
+                
+                const currentDocData: firebase.firestore.DocumentData | undefined = docSnap.exists ? docSnap.data() : undefined;
+                const newVotes: Votes = {};
+                PERMANENT_CANDIDIDATES.forEach(c => {
+                    newVotes[c.abbreviation] = currentDocData?.[c.abbreviation] || 0;
+                });
+                const newNullAndVoid = currentDocData?.nullAndVoid || 0;
+                
+                const newData = {
+                    votes: newVotes,
+                    nullAndVoid: newNullAndVoid
+                };
+
+                // Update the local cache with the latest data.
+                allPcData[code] = newData;
+
+                // Calculate deltas and update the aggregated state functionally.
+                setDistrictVotes(prevVotes => {
+                    const updatedVotes = { ...prevVotes };
+                    PERMANENT_CANDIDIDATES.forEach(c => {
+                        const abbr = c.abbreviation;
+                        const oldVoteCount = oldData.votes[abbr] || 0;
+                        const newVoteCount = newData.votes[abbr] || 0;
+                        const delta = newVoteCount - oldVoteCount;
+                        updatedVotes[abbr] = (updatedVotes[abbr] || 0) + delta;
+                    });
+                    return updatedVotes;
+                });
+
+                setDistrictNullAndVoid(prevNullAndVoid => {
+                    const delta = newData.nullAndVoid - oldData.nullAndVoid;
+                    return prevNullAndVoid + delta;
+                });
+            });
+        });
+
+        setIsLoadingDistrictData(false);
+
+        return () => {
+            unsubscribes.forEach(unsub => unsub());
+        };
+    }, [db, viewMode, selectedRegion, selectedDistrict]);
 
   const resetSelections = (level: 'all' | 'region' | 'district' | 'constituency') => {
     if (level === 'all') setSelectedRegion('');
@@ -122,6 +218,7 @@ const App: React.FC = () => {
   
   const handlePollingCenterSelect = (pc: FlatPollingCenter | null) => {
     if (pc) {
+      setViewMode('pollingCenter');
       setSelectedRegion(pc.region);
       setSelectedDistrict(pc.district);
       setSelectedConstituency(pc.constituency);
@@ -151,10 +248,10 @@ const App: React.FC = () => {
 
     setIsSubmitting(true);
     try {
-      // FIX: Use Firebase v9+ Firestore API
-      const docRef = doc(db, "results", selectedPollingCenter.code);
-      const dataToSave = { ...votes, nullAndVoid: nullAndVoidVotes, lastUpdatedBy: user.uid, timestamp: serverTimestamp() };
-      await setDoc(docRef, dataToSave, { merge: true });
+      // FIX: Use Firebase v8 compat Firestore API.
+      const docRef = db.collection("results").doc(selectedPollingCenter.code);
+      const dataToSave = { ...votes, nullAndVoid: nullAndVoidVotes, lastUpdatedBy: user.uid, timestamp: firebase.firestore.FieldValue.serverTimestamp() };
+      await docRef.set(dataToSave, { merge: true });
       setModalContent({ title: 'Success', message: 'Results have been successfully submitted.' });
       setShowModal(true);
     } catch (error) {
@@ -166,7 +263,7 @@ const App: React.FC = () => {
     }
   };
 
-  const { districts, constituencies, pollingCenters, registeredVoters, totalVotesCast, turnout, validationError } = useMemo(() => {
+  const { districts, constituencies, pollingCenters } = useMemo(() => {
     const regionData = selectedRegion ? ELECTORAL_DATA[selectedRegion as keyof typeof ELECTORAL_DATA] : null;
     const districts = regionData ? Object.keys(regionData) : [];
     
@@ -175,22 +272,36 @@ const App: React.FC = () => {
 
     const pollingCenters = districtData && selectedConstituency ? districtData[selectedConstituency as keyof typeof districtData] : [];
     
+    return { districts, constituencies, pollingCenters };
+  }, [selectedRegion, selectedDistrict, selectedConstituency]);
+
+  const { registeredVoters, totalVotesCast, turnout, validationError } = useMemo(() => {
     const registeredVoters = selectedPollingCenter ? POLLING_CENTER_VOTER_COUNTS[selectedPollingCenter.code] || 0 : 0;
     const totalVotesCast = Object.values(votes).reduce((sum: number, current: number) => sum + current, 0) + nullAndVoidVotes;
     const turnout = registeredVoters > 0 ? (totalVotesCast / registeredVoters) * 100 : 0;
     const validationError = registeredVoters > 0 && totalVotesCast > registeredVoters;
+    return { registeredVoters, totalVotesCast, turnout, validationError };
+  }, [selectedPollingCenter, votes, nullAndVoidVotes]);
 
-    return { districts, constituencies, pollingCenters, registeredVoters, totalVotesCast, turnout, validationError };
-  }, [selectedRegion, selectedDistrict, selectedConstituency, selectedPollingCenter, votes, nullAndVoidVotes]);
+  const { districtTotalVotesCast, districtTurnout, districtValidationError } = useMemo(() => {
+    if (viewMode !== 'district') return { districtTotalVotesCast: 0, districtTurnout: 0, districtValidationError: false };
+
+    const totalVotes = Object.values(districtVotes).reduce((sum, current) => sum + current, 0) + districtNullAndVoid;
+    const turnout = districtRegisteredVoters > 0 ? (totalVotes / districtRegisteredVoters) * 100 : 0;
+    const validationError = districtRegisteredVoters > 0 && totalVotes > districtRegisteredVoters;
+
+    return { districtTotalVotesCast: totalVotes, districtTurnout: turnout, districtValidationError: validationError };
+  }, [viewMode, districtVotes, districtNullAndVoid, districtRegisteredVoters]);
 
   const barChartData = useMemo(() => {
+      const sourceVotes = viewMode === 'district' ? districtVotes : votes;
       return PERMANENT_CANDIDIDATES.map(c => ({
           name: c.abbreviation,
           party: c.party,
-          value: votes[c.abbreviation] || 0,
+          value: sourceVotes[c.abbreviation] || 0,
           color: c.color
       }));
-  }, [votes]);
+  }, [votes, districtVotes, viewMode]);
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-800 p-4 sm:p-6 lg:p-8">
@@ -205,11 +316,32 @@ const App: React.FC = () => {
           {/* Left Column: Selections & Data Entry */}
           <div className="lg:col-span-1 space-y-6">
             <div className="bg-white p-6 rounded-xl shadow-md">
-              <h2 className="text-xl font-bold mb-4 border-b pb-2">Select Polling Center</h2>
+              <h2 className="text-xl font-bold mb-2">View & Select</h2>
+              <div className="flex items-center justify-center space-x-1 p-1 bg-gray-200 rounded-lg my-4">
+                  <button 
+                      onClick={() => setViewMode('pollingCenter')} 
+                      className={`w-1/2 px-4 py-2 text-sm font-semibold rounded-md transition-colors duration-200 ${viewMode === 'pollingCenter' ? 'bg-white text-blue-600 shadow' : 'bg-transparent text-gray-600 hover:bg-gray-300'}`}
+                  >
+                      Polling Center
+                  </button>
+                  <button 
+                      onClick={() => {
+                          if (selectedDistrict) {
+                              setViewMode('district');
+                              resetSelections('constituency');
+                          }
+                      }}
+                      disabled={!selectedDistrict}
+                      className={`w-1/2 px-4 py-2 text-sm font-semibold rounded-md transition-colors duration-200 disabled:text-gray-400 disabled:cursor-not-allowed ${viewMode === 'district' ? 'bg-white text-blue-600 shadow' : 'bg-transparent text-gray-600 hover:bg-gray-300'}`}
+                      title={!selectedDistrict ? "Select a district to enable this view" : ""}
+                  >
+                      District
+                  </button>
+              </div>
+
                <div className="space-y-4">
                  <SearchPollingCenter allPollingCenters={allPollingCenters} onSelect={handlePollingCenterSelect} />
                  <hr/>
-                {/* Selects */}
                 <select value={selectedRegion} onChange={e => { setSelectedRegion(e.target.value); resetSelections('region'); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 focus:ring-blue-500 focus:border-blue-500">
                   <option value="">-- Select Region --</option>
                   {Object.keys(ELECTORAL_DATA).map(r => <option key={r} value={r}>{r}</option>)}
@@ -218,18 +350,18 @@ const App: React.FC = () => {
                    <option value="">-- Select District --</option>
                    {districts.map(d => <option key={d} value={d}>{d}</option>)}
                 </select>
-                <select value={selectedConstituency} disabled={!selectedDistrict} onChange={e => { setSelectedConstituency(e.target.value); resetSelections('constituency'); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 disabled:bg-gray-200 focus:ring-blue-500 focus:border-blue-500">
+                <select value={selectedConstituency} disabled={!selectedDistrict || viewMode === 'district'} onChange={e => { setSelectedConstituency(e.target.value); resetSelections('constituency'); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 disabled:bg-gray-200 focus:ring-blue-500 focus:border-blue-500">
                    <option value="">-- Select Constituency --</option>
                    {constituencies.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
-                <select value={selectedPollingCenter?.code || ''} disabled={!selectedConstituency} onChange={e => { const pc = pollingCenters.find(p => p.code === e.target.value) || null; setSelectedPollingCenter(pc); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 disabled:bg-gray-200 focus:ring-blue-500 focus:border-blue-500">
+                <select value={selectedPollingCenter?.code || ''} disabled={!selectedConstituency || viewMode === 'district'} onChange={e => { const pc = pollingCenters.find(p => p.code === e.target.value) || null; setSelectedPollingCenter(pc); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 disabled:bg-gray-200 focus:ring-blue-500 focus:border-blue-500">
                    <option value="">-- Select Polling Center --</option>
                    {pollingCenters.map(p => <option key={p.code} value={p.code}>{p.name} ({p.code})</option>)}
                 </select>
               </div>
             </div>
 
-            {selectedPollingCenter && (
+            {viewMode === 'pollingCenter' && selectedPollingCenter && (
               <form onSubmit={handleSubmit} className="bg-white p-6 rounded-xl shadow-md">
                 <h3 className="text-lg font-bold mb-4">Enter Votes for: <span className="text-blue-600">{selectedPollingCenter.name}</span></h3>
                 <div className="space-y-4 max-h-96 overflow-y-auto pr-2">
@@ -248,7 +380,7 @@ const App: React.FC = () => {
                    </div>
                 </div>
                  <button type="submit" disabled={isSubmitting} className="mt-6 w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-md hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors flex items-center justify-center">
-                    {isSubmitting ? 'Submitting...' : 'Submit Results'}
+                    {isSubmitting ? <><LoadingSpinner /> Submitting...</> : 'Submit Results'}
                  </button>
               </form>
             )}
@@ -257,40 +389,92 @@ const App: React.FC = () => {
           {/* Right Column: Stats & Graph */}
           <div className="lg:col-span-2 space-y-6">
             <div className="bg-white p-6 rounded-xl shadow-md">
-                <h2 className="text-xl font-bold mb-4 border-b pb-2">Statistics</h2>
-                {selectedPollingCenter ? (
-                    <>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-center">
-                        <div>
-                            <p className="text-gray-500 text-sm">Registered Voters</p>
-                            <p className="text-3xl font-bold">{registeredVoters.toLocaleString()}</p>
+                <div className="flex items-center justify-between mb-4 border-b pb-2">
+                    <h2 className="text-xl font-bold">
+                      {viewMode === 'district' ? `District Statistics: ${selectedDistrict || 'N/A'}` : 'Statistics'}
+                    </h2>
+                    {isLoadingDistrictData && <LoadingSpinner />}
+                </div>
+
+                {viewMode === 'pollingCenter' && (
+                  <>
+                    {selectedPollingCenter ? (
+                        <>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-center">
+                            <div>
+                                <p className="text-gray-500 text-sm">Registered Voters</p>
+                                <p className="text-3xl font-bold">{registeredVoters.toLocaleString()}</p>
+                            </div>
+                            <div>
+                                <p className="text-gray-500 text-sm">Total Votes Cast</p>
+                                <p className={`text-3xl font-bold ${validationError ? 'text-red-500' : ''}`}>{totalVotesCast.toLocaleString()}</p>
+                            </div>
+                            <div>
+                                <p className="text-gray-500 text-sm">Voter Turnout</p>
+                                <p className={`text-3xl font-bold ${validationError ? 'text-red-500' : 'text-green-600'}`}>{turnout.toFixed(2)}%</p>
+                            </div>
                         </div>
-                        <div>
-                            <p className="text-gray-500 text-sm">Total Votes Cast</p>
-                            <p className={`text-3xl font-bold ${validationError ? 'text-red-500' : ''}`}>{totalVotesCast.toLocaleString()}</p>
-                        </div>
-                        <div>
-                            <p className="text-gray-500 text-sm">Voter Turnout</p>
-                            <p className={`text-3xl font-bold ${validationError ? 'text-red-500' : 'text-green-600'}`}>{turnout.toFixed(2)}%</p>
-                        </div>
-                    </div>
-                    {validationError && (
-                      <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-md flex items-center gap-3">
-                        <WarningIcon className="w-6 h-6 text-red-500 flex-shrink-0" />
-                        <p className="text-sm font-medium text-red-700">Warning: Total votes cast exceed the number of registered voters.</p>
-                      </div>
+                        {validationError && (
+                          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-md flex items-center gap-3">
+                            <WarningIcon className="w-6 h-6 text-red-500 flex-shrink-0" />
+                            <p className="text-sm font-medium text-red-700">Warning: Total votes cast exceed the number of registered voters.</p>
+                          </div>
+                        )}
+                        </>
+                    ) : (
+                        <p className="text-gray-500 text-center py-8">Select a polling center to view statistics.</p>
                     )}
-                    </>
-                ) : (
-                    <p className="text-gray-500 text-center py-8">Select a polling center to view statistics.</p>
+                  </>
+                )}
+
+                {viewMode === 'district' && (
+                  <>
+                    {selectedDistrict ? (
+                        <>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-center">
+                            <div>
+                                <p className="text-gray-500 text-sm">Registered Voters</p>
+                                <p className="text-3xl font-bold">{districtRegisteredVoters.toLocaleString()}</p>
+                            </div>
+                            <div>
+                                <p className="text-gray-500 text-sm">Total Votes Cast</p>
+                                <p className={`text-3xl font-bold ${districtValidationError ? 'text-red-500' : ''}`}>{districtTotalVotesCast.toLocaleString()}</p>
+                            </div>
+                            <div>
+                                <p className="text-gray-500 text-sm">Voter Turnout</p>
+                                <p className={`text-3xl font-bold ${districtValidationError ? 'text-red-500' : 'text-green-600'}`}>{districtTurnout.toFixed(2)}%</p>
+                            </div>
+                        </div>
+                        {districtValidationError && (
+                          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-md flex items-center gap-3">
+                            <WarningIcon className="w-6 h-6 text-red-500 flex-shrink-0" />
+                            <p className="text-sm font-medium text-red-700">Warning: Total district votes cast exceed the number of registered voters.</p>
+                          </div>
+                        )}
+                        </>
+                    ) : (
+                        <p className="text-gray-500 text-center py-8">Select a district to view aggregated statistics.</p>
+                    )}
+                  </>
                 )}
             </div>
              <div className="bg-white p-6 rounded-xl shadow-md">
-                <h2 className="text-xl font-bold mb-4 border-b pb-2">Results Graph</h2>
-                 {selectedPollingCenter ? (
-                     <BarGraph data={barChartData} totalVotes={totalVotesCast > 0 ? totalVotesCast : 1} />
-                 ) : (
-                     <p className="text-gray-500 text-center py-8">Select a polling center to view results.</p>
+                <h2 className="text-xl font-bold mb-4 border-b pb-2">
+                  {viewMode === 'district' ? `District Results: ${selectedDistrict || 'N/A'}` : 'Results Graph'}
+                </h2>
+                 {viewMode === 'pollingCenter' && (
+                    selectedPollingCenter ? (
+                        <BarGraph data={barChartData} totalVotes={totalVotesCast > 0 ? totalVotesCast : 1} />
+                    ) : (
+                        <p className="text-gray-500 text-center py-8">Select a polling center to view results.</p>
+                    )
+                 )}
+                 {viewMode === 'district' && (
+                    selectedDistrict ? (
+                        <BarGraph data={barChartData} totalVotes={districtTotalVotesCast > 0 ? districtTotalVotesCast : 1} />
+                    ) : (
+                        <p className="text-gray-500 text-center py-8">Select a district to view aggregated results.</p>
+                    )
                  )}
             </div>
           </div>
