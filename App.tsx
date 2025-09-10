@@ -34,7 +34,7 @@ const App: React.FC = () => {
   const [db, setDb] = useState<firebase.firestore.Firestore | null>(null);
   const [user, setUser] = useState<firebase.User | null>(null);
 
-  const [viewMode, setViewMode] = useState<'pollingCenter' | 'district'>('pollingCenter');
+  const [viewMode, setViewMode] = useState<'pollingCenter' | 'district' | 'national'>('pollingCenter');
   const [selectedRegion, setSelectedRegion] = useState('');
   const [selectedDistrict, setSelectedDistrict] = useState('');
   const [selectedConstituency, setSelectedConstituency] = useState('');
@@ -50,6 +50,12 @@ const App: React.FC = () => {
   const [districtRegisteredVoters, setDistrictRegisteredVoters] = useState(0);
   const [isLoadingDistrictData, setIsLoadingDistrictData] = useState(false);
   
+  // NEW: State for national view
+  const [nationalVotes, setNationalVotes] = useState<Votes>(initialVotesState);
+  const [nationalNullAndVoid, setNationalNullAndVoid] = useState(0);
+  const [nationalRegisteredVoters, setNationalRegisteredVoters] = useState(0);
+  const [isLoadingNationalData, setIsLoadingNationalData] = useState(false);
+
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showModal, setShowModal] = useState(false);
   const [modalContent, setModalContent] = useState({ title: '', message: '' });
@@ -71,6 +77,11 @@ const App: React.FC = () => {
     }
     return centers;
   }, []);
+
+  // NEW: Memoize all polling center codes for the national listener
+  const allPollingCenterCodes = useMemo<string[]>(() => {
+    return allPollingCenters.map(pc => pc.code);
+  }, [allPollingCenters]);
   
   // Firebase Initialization and Auth
   useEffect(() => {
@@ -207,6 +218,64 @@ const App: React.FC = () => {
         };
     }, [db, viewMode, selectedRegion, selectedDistrict]);
 
+    // NEW: Firestore listener for national view
+    useEffect(() => {
+        if (viewMode !== 'national' || !db) {
+            setNationalVotes(initialVotesState);
+            setNationalNullAndVoid(0);
+            setNationalRegisteredVoters(0);
+            return;
+        }
+
+        setIsLoadingNationalData(true);
+
+        const totalVoters = Object.values(POLLING_CENTER_VOTER_COUNTS).reduce((sum, count) => sum + count, 0);
+        setNationalRegisteredVoters(totalVoters);
+
+        setNationalVotes(initialVotesState);
+        setNationalNullAndVoid(0);
+
+        const allPcData: { [code: string]: { votes: Votes, nullAndVoid: number } } = {};
+
+        const unsubscribes = allPollingCenterCodes.map(code => {
+            const docRef = db.collection("results").doc(code);
+            return docRef.onSnapshot((docSnap) => {
+                const oldData = allPcData[code] || { votes: initialVotesState, nullAndVoid: 0 };
+                
+                const currentDocData = docSnap.exists ? docSnap.data() : undefined;
+                const newVotes: Votes = {};
+                PERMANENT_CANDIDIDATES.forEach(c => {
+                    newVotes[c.abbreviation] = currentDocData?.[c.abbreviation] || 0;
+                });
+                const newNullAndVoid = currentDocData?.nullAndVoid || 0;
+                
+                const newData = { votes: newVotes, nullAndVoid: newNullAndVoid };
+                allPcData[code] = newData;
+
+                setNationalVotes(prevVotes => {
+                    const updatedVotes = { ...prevVotes };
+                    PERMANENT_CANDIDIDATES.forEach(c => {
+                        const abbr = c.abbreviation;
+                        const delta = (newData.votes[abbr] || 0) - (oldData.votes[abbr] || 0);
+                        updatedVotes[abbr] = (updatedVotes[abbr] || 0) + delta;
+                    });
+                    return updatedVotes;
+                });
+
+                setNationalNullAndVoid(prevNullAndVoid => {
+                    const delta = newData.nullAndVoid - oldData.nullAndVoid;
+                    return prevNullAndVoid + delta;
+                });
+            });
+        });
+
+        setIsLoadingNationalData(false);
+
+        return () => {
+            unsubscribes.forEach(unsub => unsub());
+        };
+    }, [db, viewMode, allPollingCenterCodes]);
+
   const resetSelections = (level: 'all' | 'region' | 'district' | 'constituency') => {
     if (level === 'all') setSelectedRegion('');
     if (level === 'all' || level === 'region') setSelectedDistrict('');
@@ -293,15 +362,31 @@ const App: React.FC = () => {
     return { districtTotalVotesCast: totalVotes, districtTurnout: turnout, districtValidationError: validationError };
   }, [viewMode, districtVotes, districtNullAndVoid, districtRegisteredVoters]);
 
+  // NEW: Memoized calculations for National view
+  const { nationalTotalVotesCast, nationalTurnout, nationalValidationError } = useMemo(() => {
+    if (viewMode !== 'national') return { nationalTotalVotesCast: 0, nationalTurnout: 0, nationalValidationError: false };
+
+    const totalVotes = Object.values(nationalVotes).reduce((sum, current) => sum + current, 0) + nationalNullAndVoid;
+    const turnout = nationalRegisteredVoters > 0 ? (totalVotes / nationalRegisteredVoters) * 100 : 0;
+    const validationError = nationalRegisteredVoters > 0 && totalVotes > nationalRegisteredVoters;
+
+    return { nationalTotalVotesCast: totalVotes, nationalTurnout: turnout, nationalValidationError: validationError };
+  }, [viewMode, nationalVotes, nationalNullAndVoid, nationalRegisteredVoters]);
+
+
   const barChartData = useMemo(() => {
-      const sourceVotes = viewMode === 'district' ? districtVotes : votes;
+      const sourceVotes = 
+        viewMode === 'district' ? districtVotes :
+        viewMode === 'national' ? nationalVotes :
+        votes;
+
       return PERMANENT_CANDIDIDATES.map(c => ({
           name: c.abbreviation,
           party: c.party,
           value: sourceVotes[c.abbreviation] || 0,
           color: c.color
       }));
-  }, [votes, districtVotes, viewMode]);
+  }, [votes, districtVotes, nationalVotes, viewMode]);
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-800 p-4 sm:p-6 lg:p-8">
@@ -320,9 +405,9 @@ const App: React.FC = () => {
               <div className="flex items-center justify-center space-x-1 p-1 bg-gray-200 rounded-lg my-4">
                   <button 
                       onClick={() => setViewMode('pollingCenter')} 
-                      className={`w-1/2 px-4 py-2 text-sm font-semibold rounded-md transition-colors duration-200 ${viewMode === 'pollingCenter' ? 'bg-white text-blue-600 shadow' : 'bg-transparent text-gray-600 hover:bg-gray-300'}`}
+                      className={`w-1/3 px-3 py-2 text-sm font-semibold rounded-md transition-colors duration-200 ${viewMode === 'pollingCenter' ? 'bg-white text-blue-600 shadow' : 'bg-transparent text-gray-600 hover:bg-gray-300'}`}
                   >
-                      Polling Center
+                      Center
                   </button>
                   <button 
                       onClick={() => {
@@ -332,10 +417,16 @@ const App: React.FC = () => {
                           }
                       }}
                       disabled={!selectedDistrict}
-                      className={`w-1/2 px-4 py-2 text-sm font-semibold rounded-md transition-colors duration-200 disabled:text-gray-400 disabled:cursor-not-allowed ${viewMode === 'district' ? 'bg-white text-blue-600 shadow' : 'bg-transparent text-gray-600 hover:bg-gray-300'}`}
+                      className={`w-1/3 px-3 py-2 text-sm font-semibold rounded-md transition-colors duration-200 disabled:text-gray-400 disabled:cursor-not-allowed ${viewMode === 'district' ? 'bg-white text-blue-600 shadow' : 'bg-transparent text-gray-600 hover:bg-gray-300'}`}
                       title={!selectedDistrict ? "Select a district to enable this view" : ""}
                   >
                       District
+                  </button>
+                  <button 
+                      onClick={() => { setViewMode('national'); resetSelections('all'); }}
+                      className={`w-1/3 px-3 py-2 text-sm font-semibold rounded-md transition-colors duration-200 ${viewMode === 'national' ? 'bg-white text-blue-600 shadow' : 'bg-transparent text-gray-600 hover:bg-gray-300'}`}
+                  >
+                      National
                   </button>
               </div>
 
@@ -350,11 +441,11 @@ const App: React.FC = () => {
                    <option value="">-- Select District --</option>
                    {districts.map(d => <option key={d} value={d}>{d}</option>)}
                 </select>
-                <select value={selectedConstituency} disabled={!selectedDistrict || viewMode === 'district'} onChange={e => { setSelectedConstituency(e.target.value); resetSelections('constituency'); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 disabled:bg-gray-200 focus:ring-blue-500 focus:border-blue-500">
+                <select value={selectedConstituency} disabled={!selectedDistrict || viewMode === 'district' || viewMode === 'national'} onChange={e => { setSelectedConstituency(e.target.value); resetSelections('constituency'); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 disabled:bg-gray-200 focus:ring-blue-500 focus:border-blue-500">
                    <option value="">-- Select Constituency --</option>
                    {constituencies.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
-                <select value={selectedPollingCenter?.code || ''} disabled={!selectedConstituency || viewMode === 'district'} onChange={e => { const pc = pollingCenters.find(p => p.code === e.target.value) || null; setSelectedPollingCenter(pc); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 disabled:bg-gray-200 focus:ring-blue-500 focus:border-blue-500">
+                <select value={selectedPollingCenter?.code || ''} disabled={!selectedConstituency || viewMode === 'district' || viewMode === 'national'} onChange={e => { const pc = pollingCenters.find(p => p.code === e.target.value) || null; setSelectedPollingCenter(pc); }} className="w-full p-2 border border-gray-300 rounded-md bg-gray-50 disabled:bg-gray-200 focus:ring-blue-500 focus:border-blue-500">
                    <option value="">-- Select Polling Center --</option>
                    {pollingCenters.map(p => <option key={p.code} value={p.code}>{p.name} ({p.code})</option>)}
                 </select>
@@ -391,9 +482,11 @@ const App: React.FC = () => {
             <div className="bg-white p-6 rounded-xl shadow-md">
                 <div className="flex items-center justify-between mb-4 border-b pb-2">
                     <h2 className="text-xl font-bold">
-                      {viewMode === 'district' ? `District Statistics: ${selectedDistrict || 'N/A'}` : 'Statistics'}
+                        {viewMode === 'district' ? `District Statistics: ${selectedDistrict || 'N/A'}` : 
+                         viewMode === 'national' ? 'National Statistics' : 
+                         'Polling Center Statistics'}
                     </h2>
-                    {isLoadingDistrictData && <LoadingSpinner />}
+                    {(isLoadingDistrictData || isLoadingNationalData) && <LoadingSpinner />}
                 </div>
 
                 {viewMode === 'pollingCenter' && (
@@ -457,24 +550,51 @@ const App: React.FC = () => {
                     )}
                   </>
                 )}
+
+                {viewMode === 'national' && (
+                    <>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-center">
+                            <div>
+                                <p className="text-gray-500 text-sm">Registered Voters</p>
+                                <p className="text-3xl font-bold">{nationalRegisteredVoters.toLocaleString()}</p>
+                            </div>
+                            <div>
+                                <p className="text-gray-500 text-sm">Total Votes Cast</p>
+                                <p className={`text-3xl font-bold ${nationalValidationError ? 'text-red-500' : ''}`}>{nationalTotalVotesCast.toLocaleString()}</p>
+                            </div>
+                            <div>
+                                <p className="text-gray-500 text-sm">Voter Turnout</p>
+                                <p className={`text-3xl font-bold ${nationalValidationError ? 'text-red-500' : 'text-green-600'}`}>{nationalTurnout.toFixed(2)}%</p>
+                            </div>
+                        </div>
+                        {nationalValidationError && (
+                          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-md flex items-center gap-3">
+                            <WarningIcon className="w-6 h-6 text-red-500 flex-shrink-0" />
+                            <p className="text-sm font-medium text-red-700">Warning: Total national votes cast exceed the number of registered voters.</p>
+                          </div>
+                        )}
+                    </>
+                )}
             </div>
              <div className="bg-white p-6 rounded-xl shadow-md">
                 <h2 className="text-xl font-bold mb-4 border-b pb-2">
-                  {viewMode === 'district' ? `District Results: ${selectedDistrict || 'N/A'}` : 'Results Graph'}
+                  {viewMode === 'district' ? `District Results: ${selectedDistrict || 'N/A'}` : 
+                   viewMode === 'national' ? 'National Results' :
+                   'Results Graph'}
                 </h2>
-                 {viewMode === 'pollingCenter' && (
-                    selectedPollingCenter ? (
-                        <BarGraph data={barChartData} totalVotes={totalVotesCast > 0 ? totalVotesCast : 1} />
-                    ) : (
-                        <p className="text-gray-500 text-center py-8">Select a polling center to view results.</p>
-                    )
-                 )}
-                 {viewMode === 'district' && (
-                    selectedDistrict ? (
-                        <BarGraph data={barChartData} totalVotes={districtTotalVotesCast > 0 ? districtTotalVotesCast : 1} />
-                    ) : (
-                        <p className="text-gray-500 text-center py-8">Select a district to view aggregated results.</p>
-                    )
+                 {(viewMode === 'pollingCenter' && !selectedPollingCenter) || (viewMode === 'district' && !selectedDistrict) ? (
+                    <p className="text-gray-500 text-center py-8">
+                      {viewMode === 'pollingCenter' ? 'Select a polling center to view results.' : 'Select a district to view aggregated results.'}
+                    </p>
+                 ) : (
+                    <BarGraph 
+                        data={barChartData} 
+                        totalVotes={
+                            viewMode === 'district' ? (districtTotalVotesCast > 0 ? districtTotalVotesCast : 1) :
+                            viewMode === 'national' ? (nationalTotalVotesCast > 0 ? nationalTotalVotesCast : 1) :
+                            (totalVotesCast > 0 ? totalVotesCast : 1)
+                        } 
+                    />
                  )}
             </div>
           </div>
