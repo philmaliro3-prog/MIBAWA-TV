@@ -43,6 +43,9 @@ const App: React.FC = () => {
   // State for polling center view
   const [votes, setVotes] = useState<Votes>(initialVotesState);
   const [nullAndVoidVotes, setNullAndVoidVotes] = useState(0);
+  const [isFormDirty, setIsFormDirty] = useState(false); // NEW: Track unsaved changes
+  const [lastActivePollingCenter, setLastActivePollingCenter] = useState<PollingCenter | null>(null); // NEW: Remember last context
+
 
   // State for district view
   const [districtVotes, setDistrictVotes] = useState<Votes>(initialVotesState);
@@ -110,9 +113,15 @@ const App: React.FC = () => {
     }
   }, [db]);
 
+  // NEW: Effect to reset dirty flag when polling center changes, allowing new data to load.
+  useEffect(() => {
+    setIsFormDirty(false);
+  }, [selectedPollingCenter?.code]);
+
   // Firestore listener for polling center view
   useEffect(() => {
-    if (db && selectedPollingCenter?.code && viewMode === 'pollingCenter') {
+    // FIX: Do not fetch from Firestore if form has unsaved changes, to prevent overwriting user input.
+    if (db && selectedPollingCenter?.code && viewMode === 'pollingCenter' && !isFormDirty) {
       // FIX: Use Firebase v8 compat Firestore API.
       const docRef = db.collection("results").doc(selectedPollingCenter.code);
       const unsub = docRef.onSnapshot((docSnap) => {
@@ -133,7 +142,8 @@ const App: React.FC = () => {
       });
       return () => unsub();
     }
-  }, [db, selectedPollingCenter, viewMode]);
+  }, [db, selectedPollingCenter?.code, viewMode, isFormDirty]);
+
 
     // Firestore listener for district view (aggregates data)
     useEffect(() => {
@@ -276,6 +286,21 @@ const App: React.FC = () => {
         };
     }, [db, viewMode, allPollingCenterCodes]);
 
+    // NEW: Effect to restore the last active polling center when switching back to the 'Center' view.
+    useEffect(() => {
+        if (viewMode === 'pollingCenter' && !selectedPollingCenter && lastActivePollingCenter) {
+            const fullPc = allPollingCenters.find(pc => pc.code === lastActivePollingCenter.code);
+            if (fullPc) {
+                // Manually restore selections without triggering a data wipe
+                setSelectedRegion(fullPc.region);
+                setSelectedDistrict(fullPc.district);
+                setSelectedConstituency(fullPc.constituency);
+                setSelectedPollingCenter({ code: fullPc.code, name: fullPc.name });
+            }
+        }
+    }, [viewMode, selectedPollingCenter, lastActivePollingCenter, allPollingCenters]);
+
+
   const resetSelections = (level: 'all' | 'region' | 'district' | 'constituency') => {
     if (level === 'all') setSelectedRegion('');
     if (level === 'all' || level === 'region') setSelectedDistrict('');
@@ -283,6 +308,7 @@ const App: React.FC = () => {
     if (level === 'all' || level === 'region' || level === 'district' || level === 'constituency') setSelectedPollingCenter(null);
     setVotes(initialVotesState);
     setNullAndVoidVotes(0);
+    setIsFormDirty(false); // A reset clears any unsaved work.
   };
   
   const handlePollingCenterSelect = (pc: FlatPollingCenter | null) => {
@@ -302,6 +328,7 @@ const App: React.FC = () => {
     const numValue = parseInt(value, 10);
     newVotes[abbreviation] = isNaN(numValue) || numValue < 0 ? 0 : numValue;
     setVotes(newVotes);
+    setIsFormDirty(true); // Mark form as dirty
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -321,6 +348,7 @@ const App: React.FC = () => {
       const docRef = db.collection("results").doc(selectedPollingCenter.code);
       const dataToSave = { ...votes, nullAndVoid: nullAndVoidVotes, lastUpdatedBy: user.uid, timestamp: firebase.firestore.FieldValue.serverTimestamp() };
       await docRef.set(dataToSave, { merge: true });
+      setIsFormDirty(false); // Mark form as clean after successful submission
       setModalContent({ title: 'Success', message: 'Results have been successfully submitted.' });
       setShowModal(true);
     } catch (error) {
@@ -411,9 +439,12 @@ const App: React.FC = () => {
                   </button>
                   <button 
                       onClick={() => {
+                          // FIX: Don't reset selections, just switch view. Context will be preserved.
                           if (selectedDistrict) {
+                              if (viewMode === 'pollingCenter' && selectedPollingCenter) {
+                                  setLastActivePollingCenter(selectedPollingCenter);
+                              }
                               setViewMode('district');
-                              resetSelections('constituency');
                           }
                       }}
                       disabled={!selectedDistrict}
@@ -423,7 +454,14 @@ const App: React.FC = () => {
                       District
                   </button>
                   <button 
-                      onClick={() => { setViewMode('national'); resetSelections('all'); }}
+                      onClick={() => {
+                          // FIX: Preserve context before switching, then reset selections for national view.
+                          if (viewMode === 'pollingCenter' && selectedPollingCenter) {
+                                setLastActivePollingCenter(selectedPollingCenter);
+                          }
+                          setViewMode('national');
+                          resetSelections('all');
+                      }}
                       className={`w-1/3 px-3 py-2 text-sm font-semibold rounded-md transition-colors duration-200 ${viewMode === 'national' ? 'bg-white text-blue-600 shadow' : 'bg-transparent text-gray-600 hover:bg-gray-300'}`}
                   >
                       National
@@ -467,7 +505,17 @@ const App: React.FC = () => {
                   ))}
                    <div className="grid grid-cols-2 gap-4 items-center border-t pt-4 mt-2">
                       <label htmlFor="nullAndVoid" className="font-semibold text-red-600">Null & Void</label>
-                      <input type="number" min="0" id="nullAndVoid" value={nullAndVoidVotes || ''} onChange={e => setNullAndVoidVotes(parseInt(e.target.value) || 0)} className="w-full p-2 border border-gray-300 rounded-md text-right focus:ring-blue-500 focus:border-blue-500" />
+                      <input 
+                        type="number" 
+                        min="0" 
+                        id="nullAndVoid" 
+                        value={nullAndVoidVotes || ''} 
+                        onChange={e => {
+                          setNullAndVoidVotes(parseInt(e.target.value) || 0);
+                          setIsFormDirty(true); // Mark form as dirty
+                        }} 
+                        className="w-full p-2 border border-gray-300 rounded-md text-right focus:ring-blue-500 focus:border-blue-500" 
+                      />
                    </div>
                 </div>
                  <button type="submit" disabled={isSubmitting} className="mt-6 w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-md hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors flex items-center justify-center">
