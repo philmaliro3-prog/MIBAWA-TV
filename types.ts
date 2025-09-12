@@ -15,17 +15,19 @@ export interface Candidate {
   color: string;
 }
 
-// FIX: Added missing GroundingChunk interface to resolve import errors.
+// NEW: Add Constituency type for new search component
+export interface Constituency {
+  region: string;
+  district: string;
+  constituency: string;
+  id: string;
+  status?: 'Submitted' | 'In Progress' | 'Not Started';
+}
+
+// FIX: Add GroundingChunk interface for Gemini API search grounding results.
 export interface GroundingChunk {
   web: {
     uri: string;
     title: string;
   };
-}
-
-// NEW: Added for search functionality
-export interface FlatPollingCenter extends PollingCenter {
-  region: string;
-  district: string;
-  constituency: string;
 }
